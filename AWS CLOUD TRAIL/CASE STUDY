@@ -1,0 +1,155 @@
+## Overview
+Forensic investigation of a security incident involving compromised IAM credentials, privilege escalation via role assumption, and sensitive data exfiltration from an S3 bucket. This case study demonstrates CloudTrail log analysis, attack path reconstruction, and incident validation.
+
+## Scenario
+Huge Logistics security team detected unusual activity in their AWS environment and provided compromised credentials alongside CloudTrail logs. The investigation focused on confirming the breach, identifying the attack vector, and determining what data was compromised.
+
+## Tools & Technologies
+- **AWS Services**: CloudTrail, IAM, S3, STS
+- **Analysis Tools**: `jq`, `grep`, AWS CLI
+- **Environment**: Linux command line
+- **Log Format**: JSON (AWS CloudTrail)
+
+## Investigation Methodology
+
+### 1. **Log Acquisition & Preparation**
+Downloaded CloudTrail logs (INCIDENT-3252.zip) and prettified JSON files for analysis:
+```bash
+unzip INCIDENT-3252.zip -d INCIDENT-3252
+cd INCIDENT-3252
+for file in *.json; do jq . "$file" > "$file.tmp" && mv "$file.tmp" "$file"; done
+```
+
+### 2. **Threat Actor Identification**
+Enumerated AWS principals to identify anomalous accounts:
+```bash
+grep -r userName | sort -u
+```
+**Finding**: Suspicious IAM user `temp-user` identified (non-standard naming convention).
+
+### 3. **Timeline Reconstruction**
+Analyzed logs chronologically starting from earliest activity (T2035):
+
+**Initial Reconnaissance (20:29:37 UTC)**
+```bash
+grep -h -A 10 temp-user 107513503799_CloudTrail_us-east-1_20230826T2035Z_*.json
+```
+- Attacker executed `aws sts get-caller-identity` (situational awareness)
+- Source IP: `84.32.71.19` (Cherry Servers - unauthorized cloud provider)
+- Access Key: `AKIARSCCN4A3WD4RO4P4`
+
+**Failed Access Attempt (T2040)**
+- Attempted to list `emergency-data-recovery` S3 bucket → **Access Denied**
+
+**Permission Enumeration (T2050-T2055)**
+- Attacker brute-forced IAM permissions across multiple AWS services
+- 450+ AccessDenied errors logged (likely using `aws-enumerator` or `pacu`)
+
+**Privilege Escalation (T2100)**
+```bash
+grep -A 20 temp-user 107513503799_CloudTrail_us-east-1_20230826T2100Z_*.json
+```
+- Successfully assumed `AdminRole` via `sts:AssumeRole`
+- Verified new context with `get-caller-identity`
+
+**Data Exfiltration (21:17:10 UTC)**
+```bash
+grep eventName 107513503799_CloudTrail_us-east-1_20230826T2120Z_*.json
+```
+- Listed S3 bucket contents (`ListObjects`)
+- Downloaded `emergency.txt` and `message.txt` (`GetObject` events)
+- Source IP: `84.32.71.125` (same Cherry Servers range)
+
+### 4. **Attack Path Validation**
+Replicated attacker's actions to confirm exploitation path:
+
+```bash
+# Configure compromised credentials
+aws configure
+
+# Verify identity
+aws sts get-caller-identity
+
+# Enumerate inline policies
+aws iam list-user-policies --user-name temp-user
+aws iam get-user-policy --user-name temp-user --policy-name test-temp-user
+
+# Assume AdminRole
+aws sts assume-role --role-arn arn:aws:iam::107513503799:role/AdminRole --role-session-name MySession
+
+# Configure temporary credentials + session token
+aws configure set aws_access_key_id 
+aws configure set aws_secret_access_key 
+aws configure set aws_session_token 
+
+# Verify elevated privileges
+aws sts get-caller-identity
+
+# Access S3 bucket
+aws s3 ls s3://emergency-data-recovery
+aws s3 cp s3://emergency-data-recovery/emergency.txt .
+```
+
+**Result**: Successfully retrieved exfiltrated data, confirming full attack path.
+
+## Key Findings
+
+| **Indicator** | **Details** |
+|---------------|-------------|
+| **Compromised Account** | IAM user `temp-user` (ARN: `arn:aws:iam::107513503799:user/temp-user`) |
+| **Attack Origin** | Cherry Servers IPs: `84.32.71.19`, `84.32.71.125`, `84.32.71.3` |
+| **Privilege Escalation** | `temp-user` → `AdminRole` via `sts:AssumeRole` |
+| **Exfiltrated Data** | `emergency.txt`, `message.txt` from `emergency-data-recovery` bucket |
+| **Attack Duration** | ~50 minutes (20:29 - 21:17 UTC) |
+| **IOCs** | 450+ permission enumeration attempts, non-standard IAM naming |
+
+## Attack Path Diagram
+┌─────────────────┐
+│ Compromised IAM │
+│  temp-user      │ ──► Get Caller Identity (Recon)
+└────────┬────────┘
+│
+▼
+┌─────────────────┐
+│ Failed S3 Access│ ──► Access Denied (emergency-data-recovery)
+└────────┬────────┘
+│
+▼
+┌─────────────────┐
+│ Permission Enum │ ──► 450+ Brute Force Attempts
+└────────┬────────┘
+│
+▼
+┌─────────────────┐
+│ Assume AdminRole│ ──► sts:AssumeRole SUCCESS
+└────────┬────────┘
+│
+▼
+┌─────────────────┐
+│ Data Exfiltration│ ──► emergency.txt + message.txt
+└─────────────────┘
+
+## Screenshots
+*(Add your investigation screenshots here)*
+- CloudTrail log analysis (`jq` output)
+- IAM policy enumeration
+- Role assumption proof
+- S3 bucket access confirmation
+
+## Remediation Recommendations
+1. **Immediate**: Revoke `temp-user` credentials and rotate all API keys
+2. **Short-term**: 
+   - Audit all IAM roles with `sts:AssumeRole` permissions
+   - Enable S3 bucket versioning + MFA Delete
+   - Configure CloudTrail alerts for `AssumeRole` events from untrusted IPs
+3. **Long-term**:
+   - Implement IAM Access Analyzer for overly permissive policies
+   - Deploy AWS GuardDuty for anomaly detection
+   - Enforce least privilege with SCPs (Service Control Policies)
+
+## Skills Demonstrated
+- CloudTrail log forensics
+- IAM permission analysis
+- Attack path reconstruction
+- AWS CLI proficiency
+- Incident response methodology
